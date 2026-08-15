@@ -1,4 +1,4 @@
-name: 'Terraform Plan and Apply'
+name: 'Terraform Plan, Audit & Self-Heal'
 
 on:
   push:
@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pull-requests: write
+  contents: write        # Required to commit auto-fixes back to PR
+  pull-requests: write   # Required to post audit reports to PR comments
 
 env:
   ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
@@ -22,39 +22,15 @@ env:
 
 jobs:
   terraform-plan:
-    name: 'Terraform Plan'
+    name: 'Terraform Plan & Security Audit'
     runs-on: ubuntu-latest
     outputs:
       plan-exitcode: ${{ steps.tf-plan.outputs.exitcode }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Format Check
-        run: terraform fmt -check
-
-      - name: Terraform Validate
-        run: terraform validate
-
-      - name: Terraform Plan
-        id: tf-plan
-        run: |
-          export exitcode=0
-          terraform plan -detailed-exitcode -out=tfplan || export exitcode=$?
-          echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
-          if [ $exitcode -eq 1 ]; then
-            echo "Terraform plan failed!"
-            exit 1
-          fi
-
-      - name: Render Text Plan
-        run: terraform show -no-color tfplan > tfplan.txt
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js (for Claude CLI)
         uses: actions/setup-node@v4
@@ -64,14 +40,42 @@ jobs:
       - name: Install Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check > fmt_err.log 2>&1
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color > validate_err.log 2>&1
+
+      - name: Terraform Plan
+        id: tf-plan
+        run: |
+          export exitcode=0
+          terraform plan -detailed-exitcode -out=tfplan > plan_err.log 2>&1 || export exitcode=$?
+          echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
+          if [ $exitcode -eq 1 ]; then
+            echo "Terraform plan failed!"
+            exit 1
+          fi
+
+      - name: Render Text Plan
+        if: steps.tf-plan.outputs.exitcode == '0' || steps.tf-plan.outputs.exitcode == '2'
+        run: terraform show -no-color tfplan > tfplan.txt
+
       - name: Claude AI Security Audit
         id: claude-audit
+        if: steps.tf-plan.outputs.exitcode == '0' || steps.tf-plan.outputs.exitcode == '2'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           PLAN_TEXT=$(cat tfplan.txt)
           
-          # Pass plan output to Claude in headless (-p) mode
           AUDIT_RESULT=$(claude -p "
           You are a Senior Cloud DevOps Security Auditor inspecting a Terraform Plan for Azure.
           Evaluate the following Terraform Plan against repository policies in CLAUDE.md and Azure security best practices.
@@ -97,12 +101,15 @@ jobs:
 
           if grep -q "STATUS: FAIL" audit_report.md; then
             echo "audit_passed=false" >> $GITHUB_OUTPUT
+            echo "Security Audit Failed!" > audit_err.log
+            cat audit_report.md >> audit_err.log
+            exit 1
           else
             echo "audit_passed=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Comment Audit Results on Pull Request
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && (steps.tf-plan.outputs.exitcode == '0' || steps.tf-plan.outputs.exitcode == '2')
         uses: actions/github-script@v7
         with:
           script: |
@@ -122,14 +129,51 @@ jobs:
               body: `${title}\n\n${report}`
             });
 
-      - name: Block Pipeline on Audit Failure
+      # =========================================================================
+      # CLAUDE SELF-HEAL STEP (Runs on syntax, validation, plan, or audit failure)
+      # =========================================================================
+      - name: Claude Auto-Fix & Remediation
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ "${{ steps.claude-audit.outputs.audit_passed }}" != "true" ]; then
-            echo "ERROR: Claude Security Audit detected policy violations."
-            exit 1
+          echo "### Pipeline failure detected. Triggering Claude Auto-Fix..."
+          
+          # Consolidate all potential log files
+          touch fmt_err.log validate_err.log plan_err.log audit_err.log
+          ERROR_LOGS=$(cat fmt_err.log validate_err.log plan_err.log audit_err.log)
+
+          # Execute Claude CLI to fix .tf files directly in the workspace
+          claude -p "
+          You are an automated Azure Terraform Engineer.
+          The Terraform pipeline failed during execution. Below are the error logs and policy violations caught by the runner:
+
+          \`\`\`text
+          $ERROR_LOGS
+          \`\`\`
+
+          Instructions:
+          1. Analyze the error logs and locate the invalid HCL syntax, missing arguments, or security policy violations in the .tf files.
+          2. Edit the relevant .tf files in this repository to resolve the issues completely.
+          3. Ensure your fixes conform to policies defined in CLAUDE.md.
+          "
+
+          # Configure bot identity
+          git config user.name "claude-bot[bot]"
+          git config user.email "claude-bot@users.noreply.github.com"
+
+          # Stage, commit, and push changes back to the PR branch
+          git add *.tf
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(terraform): auto-remediate pipeline failure via Claude"
+            git push origin HEAD:${{ github.head_ref }}
+            echo "Auto-fix successfully committed and pushed to PR branch."
+          else
+            echo "No file changes made by Claude."
           fi
 
       - name: Upload Terraform Plan
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: tfplan
@@ -137,7 +181,7 @@ jobs:
 
   terraform-apply:
     name: 'Terraform Apply'
-    # Runs only on the main branch if the plan generated actionable changes (exit code 2)
+    # Runs only on the main branch
     if: github.ref == 'refs/heads/main'
     needs: [terraform-plan]
     runs-on: ubuntu-latest

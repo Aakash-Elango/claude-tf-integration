@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 env:
   ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
@@ -52,6 +53,82 @@ jobs:
             exit 1
           fi
 
+      - name: Render Text Plan
+        run: terraform show -no-color tfplan > tfplan.txt
+
+      - name: Setup Node.js (for Claude CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Claude AI Security Audit
+        id: claude-audit
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PLAN_TEXT=$(cat tfplan.txt)
+          
+          # Pass plan output to Claude in headless (-p) mode
+          AUDIT_RESULT=$(claude -p "
+          You are a Senior Cloud DevOps Security Auditor inspecting a Terraform Plan for Azure.
+          Evaluate the following Terraform Plan against repository policies in CLAUDE.md and Azure security best practices.
+
+          Evaluation Criteria:
+          1. Detect open ingress rules (e.g., 0.0.0.0/0 on SSH/22 or RDP/3389).
+          2. Verify storage account encryption and TLS requirements.
+          3. Validate Azure naming conventions.
+
+          Output Format:
+          - Provide a structured Markdown summary of findings.
+          - Conclude with 'STATUS: FAIL' if critical security violations exist.
+          - Conclude with 'STATUS: PASS' if the plan is compliant.
+
+          Terraform Plan Output:
+          \`\`\`text
+          $PLAN_TEXT
+          \`\`\`
+          ")
+
+          echo "$AUDIT_RESULT" > audit_report.md
+          cat audit_report.md
+
+          if grep -q "STATUS: FAIL" audit_report.md; then
+            echo "audit_passed=false" >> $GITHUB_OUTPUT
+          else
+            echo "audit_passed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment Audit Results on Pull Request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('audit_report.md')) return;
+            const report = fs.readFileSync('audit_report.md', 'utf8');
+            const passed = "${{ steps.claude-audit.outputs.audit_passed }}" === "true";
+            
+            const title = passed 
+              ? "### 🟢 Claude Security Audit: PASSED" 
+              : "### 🔴 Claude Security Audit: FAILED";
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${title}\n\n${report}`
+            });
+
+      - name: Block Pipeline on Audit Failure
+        run: |
+          if [ "${{ steps.claude-audit.outputs.audit_passed }}" != "true" ]; then
+            echo "ERROR: Claude Security Audit detected policy violations."
+            exit 1
+          fi
+
       - name: Upload Terraform Plan
         uses: actions/upload-artifact@v4
         with:
@@ -61,7 +138,7 @@ jobs:
   terraform-apply:
     name: 'Terraform Apply'
     # Runs only on the main branch if the plan generated actionable changes (exit code 2)
-    if: github.ref == 'refs/heads/main' && needs.terraform-plan.outputs.plan-exitcode == 2
+    if: github.ref == 'refs/heads/main'
     needs: [terraform-plan]
     runs-on: ubuntu-latest
     steps:
